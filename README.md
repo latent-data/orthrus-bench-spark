@@ -4,7 +4,7 @@ Reproducible throughput benchmark comparing the Orthrus-Qwen3-8B diffusion LM ag
 
 ## TL;DR
 
-Results on two prompts (greedy decoding, max 2048 new tokens, single run):
+Results on two prompts (greedy decoding, max 2048 new tokens, average of 3 runs):
 
 | Prompt | Orthrus diffusion | Qwen3-8B AR | Speedup (diffusion vs AR) |
 |---|---|---|---|
