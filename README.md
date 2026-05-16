@@ -1,117 +1,102 @@
-<p align="center">
-  <img src="assets/orthrus_logo.svg" alt="Orthrus logo" width="30%"/>
-</p>
+# Orthrus-Qwen3-8B benchmark on NVIDIA DGX Spark
 
-# Orthrus: Memory-Efficient Parallel Token Generation via Dual-View Diffusion
+Reproducible throughput benchmark comparing the Orthrus-Qwen3-8B diffusion LM against a stock Qwen3-8B autoregressive baseline on GB10 (sm_121) hardware.
 
-Official implementation and model checkpoints for **Orthrus**, a dual-architecture framework that unifies the exact generation fidelity of autoregressive Large Language Models (LLMs) with the high-speed parallel token generation of diffusion models.
+## TL;DR
 
-<p align="center">
-  <img src="assets/orthrus.png" width="80%" alt="Orthrus Architecture">
-</p>
+| Config | tok/s |
+|---|---|
+| Orthrus diffusion mode | ~38.9 |
+| Orthrus use_diffusion_mode=False | ~3.1 |
+| Stock Qwen3-8B AR (KV cache) | TBD (expected 12-18) |
+| **Speedup (diffusion vs stock AR)** | **TBD** |
 
-https://github.com/user-attachments/assets/2a0b021c-e232-4ac6-bf5c-c582c422505e
+> The Qwen3-8B AR number and final speedup ratio will be filled in after the first complete run on real hardware. The Orthrus numbers above are from initial testing.
 
-## Model Zoo
- 
-All models use a Qwen3 backbone and guarantee **strictly lossless generation**.
- 
-| Model | Base Model | HuggingFace | Avg. Speedup |
-| :--- | :--- | :--- | :--- |
-| Orthrus-Qwen3-1.7B | Qwen3-1.7B | [🤗 HuggingFace](https://huggingface.co/chiennv/Orthrus-Qwen3-1.7B) | 4.25× |
-| Orthrus-Qwen3-4B | Qwen3-4.0B | [🤗 HuggingFace](https://huggingface.co/chiennv/Orthrus-Qwen3-4B) | 5.20× |
-| Orthrus-Qwen3-8B | Qwen3-8.0B | [🤗 HuggingFace](https://huggingface.co/chiennv/Orthrus-Qwen3-8B) | 5.36× |
- 
----
-## Installation
- 
-```bash
-uv pip install -e .
-uv pip install ninja packaging
-uv pip install flash-attn --no-build-isolation # or: pip install "flash-attn-4[cu13]" if your device supports it
+## Hardware tested
+
+- **System:** NVIDIA DGX Spark
+- **GPU:** NVIDIA GB10, compute capability 12.1 (sm_121), 128 GB unified memory
+- **CPU:** aarch64
+- **Container:** `nvcr.io/nvidia/pytorch:25.12-py3`
+- **torch:** 2.10.0a0+...nv25.12 (custom NGC build, not a PyPI release)
+- **flash-attn:** 2.7.x (preinstalled in container)
+- **transformers:** 5.8.1
+- **accelerate:** 1.13.0
+
+## What this measures and what it does not
+
+**Measured:** single-stream throughput on a fixed prompt with greedy (deterministic) decoding, up to 2048 new tokens.
+
+**Not measured:** output quality, latency under concurrent load, batch throughput, longer contexts, different prompts, sampling strategies.
+
+**Why three numbers and not two:**
+Orthrus exposes a `use_diffusion_mode=False` flag, but this is not a clean autoregressive path. The model was trained with bidirectional attention, so it has no KV cache in that mode, and the numbers are not a fair comparison to standard AR decoding. Stock Qwen3-8B with a proper KV cache is the honest baseline. The `use_diffusion_mode=False` result is included for transparency, not as the comparison worth quoting.
+
+## Quick start
+
 ```
- 
-> We recommend [`uv`](https://github.com/astral-sh/uv) for fast dependency resolution.
-
----
- 
-## Quickstart
- 
-```python
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
- 
-
-model = AutoModelForCausalLM.from_pretrained(
-    "chiennv/Orthrus-Qwen3-8B",
-    dtype=torch.bfloat16, device_map="cuda",
-    attn_implementation="flash_attention_2",  # use flash_attention_4 if your system does support
-    trust_remote_code=True,
-).eval()
-tokenizer = AutoTokenizer.from_pretrained("chiennv/Orthrus-Qwen3-8B")
- 
-prompt = "Write a program to count the frequency of each word in a paragraph."
-messages = [{"role": "system", "content": ""}, {"role": "user", "content": prompt}]
-input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True, enable_thinking=False).input_ids
-
-output_ids = model.generate(
-    input_ids=input_ids.to(model.device), 
-    max_new_tokens=2048,
-    use_diffusion_mode=True, 
-    streamer=TextStreamer(tokenizer, skip_prompt=True) # enable streaming generation
-)
+git clone <this repo>
+cd <repo dir>
+./run.sh
 ```
 
-> **Coming soon:** Native integration with [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang) is coming soon. Stay tuned!
- 
-## Key Advantages
- 
-- **Significant Inference Acceleration:** Breaks the sequential bottleneck of standard autoregressive decoding, delivering up to a $7.8\times$ speedup on generation tasks.
-- **Strictly Lossless Generation:** Employs an exact intra-model consensus mechanism to guarantee that the output matches the original base model's exact predictive distribution.
-- **Zero Redundant Memory Overhead:** Both the autoregressive and diffusion views attend to the exact same high-fidelity Key-Value (KV) cache natively, resulting in only an $O(1)$ memory cache overhead.
-- **Parameter Efficient:** Parallel generation capabilities are injected by fine-tuning only 16% of the total model parameters while keeping the base LLM strictly frozen.
+Results appear in `results/results.json`. First run downloads approximately 35 GB of model weights into `~/.cache/huggingface`.
 
----
+## Configuration
 
-## Performance Comparison: Orthrus vs. Speculative Decoding
+Flags are forwarded from `run.sh` to `benchmark.py`:
 
-Orthrus outperforms speculative decoding methods like EAGLE-3, DFlash. By natively sharing the exact same KV cache across dual views, Orthrus avoids the redundant memory overhead of draft models, resulting in significantly higher token acceptance rates and faster inference times, especially as context length scales.
+| Flag | Default | Description |
+|---|---|---|
+| `--prompt` | "Write a program..." | Input prompt |
+| `--max-new-tokens` | 2048 | Maximum tokens to generate |
+| `--warmup-tokens` | 32 | Tokens generated before timing starts |
+| `--output` | results/results.json | Path for JSON output |
+| `--orthrus-revision` | pinned SHA | HF commit for chiennv/Orthrus-Qwen3-8B |
+| `--qwen-revision` | pinned SHA | HF commit for Qwen/Qwen3-8B |
 
-<p align="center">
-  <img src="assets/acceptance_length.png" width="48%" alt="Average Acceptance Length Comparison">
-  <img src="assets/long_context_benchmark.png" width="48%" alt="Long Context Generation Time Benchmark">
-</p>
-<p align="center">
-  <em><b>Left:</b> Average verified tokens per forward pass compared to EAGLE-3 and DFlash. <b>Right:</b> Simulated generation time across scaling context lengths compared to DFlash.</em>
-</p>
+Example:
 
----
-
-## Comparison with State-of-the-Art Diffusion Models
-
-While recent diffusion language models (dLLMs) offer parallel decoding, they often suffer from significant conditional drift and severe accuracy degradation on complex reasoning tasks. Orthrus resolves this by decoupling parallel generation from sequential constraints, establishing a new state-of-the-art for parallel generation fidelity.
-
-<p align="center">
-  <img src="assets/math500_speed.png" width="60%" alt="Throughput vs. Accuracy on MATH-500">
-</p>
-<p align="center">
-  <em><b>Throughput vs. Accuracy on MATH-500.</b> Orthrus delivers a ~6x speedup over the Qwen3-8B baseline with strictly lossless performance, whereas adaptations like Fast-dLLM-v2 suffer significant accuracy drops.</em>
-</p>
-
----
-
-## Citation
-
-If you find this model or architecture useful in your work, please cite our [paper](https://arxiv.org/abs/2605.12825):
-
-```bibtex
-@misc{vannguyen2026orthrusmemoryefficientparalleltoken,
-      title={Orthrus: Memory-Efficient Parallel Token Generation via Dual-View Diffusion}, 
-      author={Chien Van Nguyen and Chaitra Hegde and Van Cuong Pham and Ryan A. Rossi and Franck Dernoncourt and Thien Huu Nguyen},
-      year={2026},
-      eprint={2605.12825},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2605.12825}, 
-}
 ```
+./run.sh --max-new-tokens 512 --output results/short_run.json
+```
+
+## Output format
+
+See `results/EXAMPLE_results.json` for the full schema. Top-level fields:
+
+- `timestamp_utc` - ISO 8601 timestamp
+- `hardware` - device name, compute capability, memory
+- `container` - image tag and name (baked in by Dockerfile)
+- `software` - torch, CUDA, transformers, accelerate, flash-attn versions
+- `config` - prompt, token limits, decoding settings, pinned revisions
+- `results` - per-model: tokens generated, elapsed seconds, tok/s, 300-char output snippet
+- `speedup_orthrus_diffusion_vs_qwen3_ar` - ratio of diffusion tok/s to stock AR tok/s
+
+## Reproducibility notes
+
+- **Pinned model revisions:**
+  - `chiennv/Orthrus-Qwen3-8B`: `34429bd987c2750bed61d65583c6879964367059`
+  - `Qwen/Qwen3-8B`: `b968826d9c46dd6066d109eabc6255188de91218`
+- **Pinned container:** `nvcr.io/nvidia/pytorch:25.12-py3`
+- **Pinned dependencies:** transformers 5.8.1, accelerate 1.13.0 (see `requirements.txt`)
+- **Deterministic decoding:** `do_sample=False` (greedy) for all three configurations
+- First run downloads approximately 19 GB (Orthrus) + 16 GB (Qwen3-8B) of weights
+
+## Limitations and caveats
+
+- Targets sm_121 (GB10) on aarch64. Will not run as-is on x86_64 or other Blackwell variants without container adjustments.
+- Uses flash-attn 2 only. FA3/FA4 do not yet support sm_121 as of the time this repo was authored.
+- Single GPU only.
+- 8B model only, no quantisation.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
+
+## Acknowledgements
+
+- Orthrus paper: [arxiv.org/abs/2605.12825](https://arxiv.org/abs/2605.12825) / [chiennv2000/orthrus](https://github.com/chiennv2000/orthrus)
+- Qwen3-8B model card: [huggingface.co/Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B)
+- DGX Spark community guides: [martimramos/dgx-spark-ml-guide](https://github.com/martimramos/dgx-spark-ml-guide), [natolambert/dgx-spark-setup](https://github.com/natolambert/dgx-spark-setup)
