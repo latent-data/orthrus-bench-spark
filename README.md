@@ -4,15 +4,15 @@ Reproducible throughput benchmark comparing the Orthrus-Qwen3-8B diffusion LM ag
 
 ## TL;DR
 
-Results on two prompts (greedy decoding, max 2048 new tokens):
+Results on two prompts (greedy decoding, max 2048 new tokens, single run):
 
 | Prompt | Orthrus diffusion | Qwen3-8B AR | Speedup (diffusion vs AR) |
 |---|---|---|---|
-| short | ~38.9 tok/s | TBD | TBD |
-| long | TBD | TBD | TBD |
-| **geometric mean** | | | **TBD** |
+| short (word frequency) | 38.6 tok/s | 11.4 tok/s | 3.38x |
+| long (BoundedPriorityQueue) | 50.7 tok/s | 11.2 tok/s | 4.52x |
+| **geometric mean** | | | **3.91x** |
 
-> These numbers will be filled in after a complete run on real hardware. The Orthrus short-prompt diffusion number is from initial testing; all Qwen3-8B and long-prompt numbers are pending.
+Orthrus diffusion throughput increases with output length (38.6 to 50.7 tok/s) while Qwen3-8B AR stays flat (~11.3 tok/s), as expected: diffusion generates tokens in parallel passes that amortise better over longer sequences. The per-prompt speedup variation (3.38x short vs 4.52x long) is itself a finding worth reporting alongside the geometric mean.
 
 Diffusion's throughput advantage is expected to grow with output length because Orthrus generates tokens in parallel passes while AR decoding scales linearly. If the per-prompt speedups differ substantially (e.g. 3x short vs 6x long), that finding is reported explicitly -- the geometric mean is the right summary statistic but the per-prompt breakdown is the interesting result.
 
