@@ -103,6 +103,26 @@ While recent diffusion language models (dLLMs) offer parallel decoding, they oft
 
 ---
 
+## Further Support
+ 
+### MLX (Apple Silicon)
+ 
+Orthrus supports native inference on Apple Silicon via [MLX](https://github.com/ml-explore/mlx). Tested with `mlx==0.31.2` and `mlx-lm==0.31.3`.
+
+**Usage:**
+ 
+```python
+from src.model_mlx import load_model_and_tokenizer, mlx_generate
+ 
+repo_id = "chiennv/Orthrus-Qwen3-1.7B"
+model, tokenizer = load_model_and_tokenizer(repo_id)
+ 
+prompt_tokens = tokenizer.encode("If a rectangle has length 12 and width 7, what is its area?")
+ 
+for token in mlx_generate(model, prompt_tokens, tokenizer.eos_token_id, max_tokens=128):
+    print(tokenizer.decode([token]), end="", flush=True)
+```
+
 ## Citation
 
 If you find this model or architecture useful in your work, please cite our [paper](https://arxiv.org/abs/2605.12825):
