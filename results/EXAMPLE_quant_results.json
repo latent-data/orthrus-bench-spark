@@ -1,0 +1,78 @@
+{
+  "_about": "Illustrative schema for results/quant_results.json produced by quant_benchmark.py. Numeric values below are placeholders, NOT measurements. Run ./run.sh quant_benchmark to populate.",
+  "timestamp_utc": "2026-05-26T10:00:00+00:00",
+  "hardware": {
+    "device_name": "NVIDIA GB10",
+    "compute_capability": [12, 1],
+    "total_memory_gb": 128.0
+  },
+  "container": {
+    "image_tag": "25.12-py3",
+    "image_name": "nvcr.io/nvidia/pytorch:25.12-py3"
+  },
+  "software": {
+    "torch": "2.10.0a0+gitXXXXXXX.nv25.12",
+    "cuda": "13.0",
+    "transformers": "5.8.1",
+    "accelerate": "1.13.0",
+    "flash_attn": "2.7.4"
+  },
+  "config": {
+    "prompts": ["short", "long"],
+    "configs": ["baseline-bf16", "teacher-int8", "teacher-int4", "full-int8"],
+    "max_new_tokens": 2048,
+    "warmup_tokens": 32,
+    "seed": null,
+    "do_sample": false,
+    "int4_mode": "per-tensor",
+    "orthrus_revision": "34429bd987c2750bed61d65583c6879964367059"
+  },
+  "notes": {
+    "quantization": "Simulated: cast-and-dequantize. Weights round-trip through int8/int4 but stay in bf16 at runtime. In-memory footprint is unchanged; the experiment isolates the distribution-shift impact of teacher precision loss from kernel-performance effects.",
+    "tpf": "tokens_per_forward_pass = generated_tokens / number of diffusion-mode iterations (proposal forward calls). One iteration also performs one AR verification forward call; total_forward_passes is reported separately.",
+    "ar_partition": "AR/teacher = all parameters whose qualified name does NOT contain '_diff' (embedding, MLP, layer norms, original Qwen3 attention projections, lm_head, final norm). This is the full set of weights the diffusion head was trained to match against; quantizing them shifts the target distribution."
+  },
+  "results": {
+    "baseline-bf16": {
+      "short": {
+        "tokens": 472,
+        "elapsed": 12.13,
+        "tps": 38.9,
+        "tpf": 5.47,
+        "diffusion_passes": 86,
+        "total_forward_passes": 173,
+        "output_token_ids": "[... full sequence omitted from example ...]",
+        "snippet": "from collections import Counter ..."
+      },
+      "long": null
+    },
+    "teacher-int8": {
+      "short": {
+        "tokens": 480,
+        "elapsed": 12.45,
+        "tps": 38.6,
+        "tpf": 5.12,
+        "diffusion_passes": 94,
+        "total_forward_passes": 189,
+        "output_token_ids": "[...]",
+        "snippet": "from collections import Counter ...",
+        "vs_baseline": {
+          "exact_match": false,
+          "edit_distance": 23,
+          "first_divergence_position": 89,
+          "tpf_delta": -0.35,
+          "throughput_delta_percent": -0.8
+        }
+      },
+      "long": null
+    },
+    "teacher-int4": {
+      "short": null,
+      "long": null
+    },
+    "full-int8": {
+      "short": null,
+      "long": null
+    }
+  }
+}

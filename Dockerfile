@@ -14,7 +14,7 @@ COPY requirements.txt .
 # break GB10 support.
 RUN pip install --no-deps -r requirements.txt
 
-COPY benchmark.py .
+COPY benchmark.py quant_benchmark.py ./
 RUN mkdir -p results
 
 CMD ["python", "benchmark.py"]

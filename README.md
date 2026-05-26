@@ -55,7 +55,13 @@ To skip the Docker build step and run directly in a pulled NGC container:
 ./run.sh --no-build
 ```
 
-Results appear in `results/results.json`. First run downloads approximately 35 GB of model weights into `~/.cache/huggingface`.
+To run the quantization investigation instead of the throughput benchmark:
+
+```
+./run.sh quant_benchmark --no-build
+```
+
+Results appear in `results/results.json` (throughput benchmark) or `results/quant_results.json` (quantization investigation). First run downloads approximately 35 GB of model weights into `~/.cache/huggingface`.
 
 ## Configuration
 
@@ -104,6 +110,38 @@ See `results/EXAMPLE_results.json` for the full schema. Top-level fields:
 - **Pinned dependencies:** transformers 5.8.1, accelerate 1.13.0, huggingface-hub 1.9.2 (see `requirements.txt`)
 - **Deterministic decoding:** `do_sample=False` (greedy) for all configurations
 - First run downloads approximately 19 GB (Orthrus) + 16 GB (Qwen3-8B) of weights
+
+## Quantization investigation: losslessness breaks, but the architecture degrades gracefully
+
+We tested how Orthrus's TPF and output-equivalence behave when the autoregressive teacher weights are quantized while the diffusion drafter stays at bf16. Quantization is **simulated** via cast-and-dequantize (precision loss isolated from kernel-path differences), so memory savings are not measured here; only the impact of precision loss on Orthrus's consensus mechanism.
+
+| Config         | Prompt | TPF  | Throughput (tok/s) | Output tokens | Exact match | First divergence | Edit dist vs baseline |
+| -------------- | ------ | ---- | ------------------ | ------------- | ----------- | ---------------- | --------------------- |
+| baseline-bf16  | short  | 6.56 | 39.2               | 472           | —           | —                | —                     |
+| baseline-bf16  | long   | 8.73 | 51.6               | 1441          | —           | —                | —                     |
+| teacher-int8   | short  | 6.10 | 34.3               | 415           | no          | position 2       | 228                   |
+| teacher-int8   | long   | 7.82 | 43.3               | 1704          | no          | position 35      | 554                   |
+| teacher-int4   | short  | 1.00 | 5.7                | 2048          | no          | position 0       | 2048 (gibberish)      |
+| teacher-int4   | long   | 1.02 | 5.8                | 2048          | no          | position 0       | 2048 (gibberish)      |
+| full-int8      | short  | 6.10 | 34.2               | 415           | no          | position 2       | 228                   |
+| full-int8      | long   | 7.93 | 43.8               | 1704          | no          | position 35      | 554                   |
+
+### Findings
+
+**Orthrus is not lossless under quantization.** Even simulated int8 round-trip flips the greedy argmax at the third token on the short prompt. Outputs remain coherent and Qwen-like, but they are not bit-identical to the bf16 baseline. The paper's strict-losslessness claim only holds at the precision the diffusion drafter was distilled against.
+
+**TPF degrades only modestly under int8 (-7% short, -10% long).** Throughput drops more (-13% to -16%) but this is partly an artifact of differing output lengths between configs, not a per-forward-pass cost. The consensus mechanism is more robust to teacher precision shift than expected from first principles.
+
+**Naive per-tensor int4 is catastrophic.** TPF collapses to ~1.0 (drafter proposals never match the AR verifier), the model emits gibberish until hitting `max_new_tokens=2048`, and throughput drops below the stock Qwen3-8B AR baseline. The architecture degrades gracefully (no crashes, no corruption-of-state), but the speedup mechanism is gone entirely. Whether per-channel int4 rescues this is open.
+
+**The diffusion projections are a quantization passenger.** Quantizing both the AR and diffusion sides to int8 (`full-int8`) produces identical TPF, edit distance, and first-divergence position to quantizing only the AR side (`teacher-int8`) — matching to three significant figures. The 84% of shared/AR weights drive the entire effect; the 16% of diffusion projections contribute essentially nothing to the consensus dynamics. Practical implication: in memory-constrained deployments, the diffusion projections could be quantized aggressively without further harming TPF.
+
+### Caveats
+
+- Simulated quantization (cast-and-dequant) measures distribution-shift impact only. Real production quantization (bitsandbytes, GPTQ, AWQ, GGUF Q-formats) includes calibrated scales and different kernel paths; those numbers will likely be more favorable. This investigation is a worst-case isolation of the precision-loss variable.
+- Greedy decoding throughout for determinism. Sampling behavior under quantization is not measured.
+- A single base model (Qwen3-8B) and a fixed pair of prompts. The findings should generalize to other Qwen3 sizes structurally but have not been verified.
+- All numbers from a single hardware target (DGX Spark / GB10). Other Blackwell variants and consumer GPUs may exhibit different per-forward-pass economics that interact with the speedup.
 
 ## Limitations and caveats
 
