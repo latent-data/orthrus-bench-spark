@@ -184,6 +184,63 @@ Default prompt set is `short, long`. Per-prompt `max_new_tokens` is set in `AR_E
 - The fp-drift hypothesis is consistent with the observed top1-top2 gaps but not directly verified. A more invasive test (capture logits at every position from both paths, compare directly) would close that loop.
 - The frozen-teacher claim that Orthrus's AR projections equal vanilla Qwen3-8B weights is taken at face value here. If those weights actually differ from vanilla Qwen3, the path-2 proxy argument weakens.
 
+## Vanilla-Qwen3 quantization sensitivity: Orthrus is not uniquely fragile to int8
+
+The quantization investigation showed Orthrus loses bit-identical output to its bf16 baseline within 2 to 35 tokens under int8 cast-and-dequant. That answers "how fragile is Orthrus" in absolute terms but not "is Orthrus *uniquely* fragile, or is it inheriting whatever fragility vanilla Qwen3-8B already has?" Two AR-mode configurations were added to answer the second question.
+
+### Result
+
+Within-arm divergence under int8 cast-and-dequant, on the same two prompts as the quantization investigation:
+
+| Arm | Prompt | first_div | top1-top2 logit gap | bf16 token | int8 token | bf16 rank in int8 logits |
+|---|---|---|---|---|---|---|
+| Orthrus (diffusion: `teacher-int8` vs `baseline-bf16`) | short | 2 | 0.7500 | ` Below` | ` Here` | 2 |
+| Orthrus | long | 35 | 0.5000 | `###` | `##` | 2 |
+| Vanilla (AR: `ar-int8` vs `ar-bf16`) | short | 2 | 0.7500 | ` Below` | ` Here` | 2 |
+| Vanilla | long | 35 | 0.5000 | `###` | `##` | 2 |
+
+**Both arms diverge at the same position, with the same logit gap, choosing the same bf16 token, and demoted to the same rank in int8's logits, on both prompts.** Not just similar fragility — bit-identical divergence events.
+
+### Finding
+
+**Orthrus is not uniquely fragile to int8 quantization. It inherits Qwen3's near-tie sensitivity, no more and no less.** The diffusion consensus mechanism does not amplify precision errors; it propagates the AR head's output as-is.
+
+The mechanistic explanation is direct: both arms share the same AR projection weights (Orthrus's diffusion path uses the AR head to verify each block's tokens; the AR-only path uses the same AR head to emit each token). At every position where both arms have the same agreed prefix, the AR head computes the same logits and the int8 cast-and-dequant perturbs them identically. So the same near-tie tips in the same direction in both arms. The first 2 tokens on the short prompt and first 35 on the long are identical across arms at bf16 (both paths emit ` Sure! `; both then continue identically up to position 35 on the long prompt), so the int8 perturbation hits the same near-tie at the same position.
+
+### Side observation: AR-mode through Orthrus runs at 2.6 tok/s on the long prompt
+
+`ar-bf16` generated at 7.4 tok/s on the short prompt and **2.6 tok/s on the long prompt**, vs `baseline-bf16` (Orthrus's normal diffusion mode through the same weights) at 39.1 and 51.5 tok/s respectively. The 19x slowdown on the long prompt is a direct re-measurement of what the diffusion mechanism is buying in tokens-per-wall-clock-second relative to plain AR generation, isolated from any vanilla-Qwen3-baseline confound (it's the same model in the same container at the same precision, just with the diffusion mechanism turned off). Consistent with and independent of the main benchmark's speedup claim.
+
+### Configurations
+
+Two new entries in the `--configs` set, both using `use_diffusion_mode=False`:
+
+| Config | Mode | Weights |
+|---|---|---|
+| `ar-bf16` | `use_diffusion_mode=False` | bf16 (no quant) |
+| `ar-int8` | `use_diffusion_mode=False` | AR/shared weights → int8 cast-and-dequant (`_diff` projections untouched since they are not accessed in AR mode) |
+
+### Methodology notes
+
+**Why the comparison is within-arm and not cross-arm.** `baseline-bf16` vs `ar-bf16` is the wrong comparison; the AR equivalence section showed those two paths diverge structurally at bf16 from cross-code-path fp drift, with nothing to do with quantization. Each arm's bf16-vs-int8 comparison isolates the int8 effect because the only thing changing within an arm is weight precision.
+
+**Why the metric is first_divergence_position paired with top1-top2 logit gap.** `first_divergence_position` answers "how many tokens of bf16-matching output can I get under int8?" — position-independent of total output length and directly interpretable. Position alone is not enough though: a first divergence at token 5 with a tiny top1-top2 gap means "quantization tipped a near-tie that was already wobbling," not "quantization substantively changed the model's prediction." The fresh-forward divergence diagnostic introduced in the AR equivalence work captures the gap at each divergence, which is what makes the "same kind of perturbation, different trajectories" / "substantively different perturbation" distinction empirically decidable.
+
+**Interpretation rule used to label the verdict.** If both arms show `bf16 rank in int8 logits ≤ 3` and `gap < 1.0` at every prompt, the verdict is "near-tie tips on both arms; Orthrus inherits Qwen3's sensitivity." If gap behaviour differs substantively (e.g. one arm has rank-1-vs-rank-5 flips with wide gaps), the verdict is "Orthrus uniquely fragile." This run hit the first branch.
+
+### Caveats
+
+- Two prompts is still a small sample. A broader prompt set (5-10 of varied length and domain) would tighten the null-result claim. The bit-identical-across-arms pattern is mechanistically inevitable for any prompt where the two arms agree on the first few tokens of generation, but the AR equivalence section showed those agreements break down by position ~100 on the long prompt; on more diverse prompts the agreement boundary will land in different places.
+- `0.7500` and `0.5000` logit gaps are suspiciously round; that reflects bf16 quantization of the logit values rather than 0.75-/0.5-nats true gaps. The values are meaningful as ordinal signals, not fine-grained continuous measurements.
+
+### How to run
+
+```bash
+./run.sh quant_benchmark --no-build
+```
+
+Default `--configs` now includes all six configurations (four diffusion-mode plus the two AR-mode). Runtime: ~80-90 min wall-clock on a DGX Spark; the AR-mode long-prompt runs at ~13 min each are the slow leg. To run only the AR arm, pass `--configs ar-bf16 --configs ar-int8`; the script will auto-include `ar-bf16` as the within-arm baseline when needed.
+
 ## Limitations and caveats
 
 - Targets sm_121 (GB10) on aarch64. Will not run as-is on x86_64 or other Blackwell variants without container adjustments.

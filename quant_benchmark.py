@@ -62,8 +62,46 @@ PROMPTS = {
     ),
 }
 
-CONFIGS = ["baseline-bf16", "teacher-int8", "teacher-int4", "full-int8"]
+CONFIGS = [
+    "baseline-bf16", "teacher-int8", "teacher-int4", "full-int8",
+    "ar-bf16", "ar-int8",
+]
 BASELINE_KEY = "baseline-bf16"
+AR_BASELINE_KEY = "ar-bf16"
+
+# Each config runs through one of two generation paths:
+#   "diffusion" -> model.generate(use_diffusion_mode=True), the normal Orthrus
+#                  speculative-decoding path
+#   "ar"        -> model.generate(use_diffusion_mode=False), HF super().generate()
+#                  through the AR projections; used as the vanilla-Qwen3 proxy
+CONFIG_MODE = {
+    "baseline-bf16": "diffusion",
+    "teacher-int8": "diffusion",
+    "teacher-int4": "diffusion",
+    "full-int8": "diffusion",
+    "ar-bf16": "ar",
+    "ar-int8": "ar",
+}
+
+# Per-config quantization scheme. ar-bf16 is a no-op (no quant); ar-int8 reuses
+# the same teacher-int8 cast-and-dequant on AR/shared weights (the _diff
+# projections are never accessed in AR mode, so quantizing them or not produces
+# identical AR output; we skip them for clarity).
+CONFIG_QUANT_SCHEME = {
+    "baseline-bf16": "none",
+    "teacher-int8": "teacher-int8",
+    "teacher-int4": "teacher-int4",
+    "full-int8": "full-int8",
+    "ar-bf16": "none",
+    "ar-int8": "teacher-int8",
+}
+
+
+def within_arm_baseline(config):
+    """Which bf16 config does this config compare against for within-arm
+    quant-sensitivity measurement?
+    """
+    return AR_BASELINE_KEY if CONFIG_MODE[config] == "ar" else BASELINE_KEY
 
 # Qwen3 <|im_end|> token. This is the natural assistant-turn terminator when
 # tokenizer.apply_chat_template(..., add_generation_prompt=True) is used.
@@ -138,9 +176,22 @@ def parse_args():
     if unknown:
         p.error(f"Unknown config name(s): {', '.join(unknown)}. "
                 f"Valid: {', '.join(CONFIGS)}")
-    if BASELINE_KEY not in selected_configs and any(c != BASELINE_KEY for c in selected_configs):
-        # Non-baseline configs need a baseline to compare against; force-include.
-        selected_configs = [BASELINE_KEY] + [c for c in selected_configs if c != BASELINE_KEY]
+    # For each requested config that isn't itself a baseline, ensure its
+    # within-arm baseline is also in the run (and ordered before it) so the
+    # in-loop comparison and diagnostic can run.
+    needed_baselines = []
+    for c in selected_configs:
+        b = within_arm_baseline(c)
+        if b != c and b not in selected_configs and b not in needed_baselines:
+            needed_baselines.append(b)
+    if needed_baselines:
+        selected_configs = needed_baselines + selected_configs
+    # Within the final list, ensure each arm's baseline precedes its other
+    # configs (stable partition: baselines first in their original order).
+    selected_configs = (
+        [c for c in selected_configs if c in (BASELINE_KEY, AR_BASELINE_KEY)]
+        + [c for c in selected_configs if c not in (BASELINE_KEY, AR_BASELINE_KEY)]
+    )
     args.configs = selected_configs
 
     ae_prompts = (args.ar_equivalence_prompts
@@ -266,24 +317,30 @@ def quantize_int4_per_channel(param):
 
 
 def apply_quantization(model, config, int4_per_channel):
+    """Apply the quantization scheme associated with `config` in place. The
+    scheme is keyed via CONFIG_QUANT_SCHEME so multiple configs can share a
+    scheme (e.g. teacher-int8 and ar-int8 both use the 'teacher-int8' scheme,
+    differing only in generation mode).
+    """
+    scheme = CONFIG_QUANT_SCHEME[config]
     ar, diff = partition_params(model)
     ar_params = [p for _, p in ar]
     diff_params = [p for _, p in diff]
 
-    if config == "baseline-bf16":
+    if scheme == "none":
         return
-    if config == "teacher-int8":
+    if scheme == "teacher-int8":
         for p in ar_params:
             quantize_int8_per_tensor(p)
-    elif config == "teacher-int4":
+    elif scheme == "teacher-int4":
         fn = quantize_int4_per_channel if int4_per_channel else quantize_int4_per_tensor
         for p in ar_params:
             fn(p)
-    elif config == "full-int8":
+    elif scheme == "full-int8":
         for p in ar_params + diff_params:
             quantize_int8_per_tensor(p)
     else:
-        raise ValueError(f"Unknown config {config!r}")
+        raise ValueError(f"Unknown quant scheme {scheme!r} for config {config!r}")
 
 
 # ----------------------------------------------------------------------------
@@ -337,6 +394,53 @@ def first_divergence(a, b):
     return None
 
 
+def compute_divergence_diagnostic(model, tokenizer, input_ids, agreed_prefix,
+                                  bf16_chosen_id, this_chosen_id):
+    """At the first within-arm divergence position, do a fresh forward pass
+    through the currently-loaded (quantized) model with the agreed prefix and
+    return top-3 logits, the top1-top2 gap, the rank in this model's logits of
+    the token the bf16 baseline would have chosen, and the rank of the token
+    this config actually chose.
+
+    A small gap + low ranks for both choices indicates a near-tie tip
+    (quantization flipped a decision that was already wobbling). A wide gap +
+    high rank for the bf16 choice indicates a substantive perturbation
+    (quantization meaningfully changed the prediction).
+    """
+    prompt_ids = input_ids[0].tolist()
+    prefix = prompt_ids + agreed_prefix
+    x = torch.tensor([prefix], dtype=torch.long, device=model.device)
+    with torch.inference_mode():
+        out = model(input_ids=x, use_cache=False, logits_to_keep=1)
+    logits = out.logits[0, -1, :].float()
+    top = torch.topk(logits, k=3)
+    top_ids = top.indices.tolist()
+    top_vals = [float(v) for v in top.values]
+    sorted_ids = torch.argsort(logits, descending=True).tolist()
+    rank_bf16 = sorted_ids.index(bf16_chosen_id) + 1
+    rank_this = sorted_ids.index(this_chosen_id) + 1
+    del sorted_ids
+    return {
+        "fresh_forward_top3_ids": top_ids,
+        "fresh_forward_top3_logits": [round(v, 4) for v in top_vals],
+        "top1_to_top2_logit_gap": round(top_vals[0] - top_vals[1], 4),
+        "bf16_chosen_id": bf16_chosen_id,
+        "bf16_chosen_text": tokenizer.decode([bf16_chosen_id]),
+        "bf16_chosen_rank_in_this_model": rank_bf16,
+        "this_chosen_id": this_chosen_id,
+        "this_chosen_text": tokenizer.decode([this_chosen_id]),
+        "this_chosen_rank_in_this_model": rank_this,
+    }
+
+
+def truncate_at_first(seq, value):
+    """Return seq[:first_index_of_value + 1], or seq unchanged if value absent."""
+    for i, x in enumerate(seq):
+        if x == value:
+            return seq[: i + 1]
+    return seq
+
+
 def levenshtein(a, b):
     """Token-level Levenshtein distance. O(len(a) * len(b)) time, O(len(b)) space."""
     n, m = len(a), len(b)
@@ -381,25 +485,27 @@ def _set_seed(seed):
 
 
 @torch.inference_mode()
-def generate_diffusion(model, input_ids, max_new_tokens):
+def generate_for_config(model, input_ids, max_new_tokens, use_diffusion_mode):
     return model.generate(
         input_ids=input_ids,
         max_new_tokens=max_new_tokens,
         do_sample=False,
-        use_diffusion_mode=True,
+        use_diffusion_mode=use_diffusion_mode,
     )
 
 
 def measure(model, tokenizer, counter, prompt_name, input_ids,
-            warmup_tokens, max_new_tokens, seed, label):
-    print(f"\n  --- {label}: prompt={prompt_name} ---")
+            warmup_tokens, max_new_tokens, seed, label,
+            use_diffusion_mode=True):
+    print(f"\n  --- {label}: prompt={prompt_name} "
+          f"(mode={'diffusion' if use_diffusion_mode else 'ar'}) ---")
 
     _set_seed(seed)
     counter.reset()
     print(f"  warmup ({warmup_tokens} tokens) ... "
           "[first call may take several minutes to compile kernels]")
     torch.cuda.synchronize()
-    _ = generate_diffusion(model, input_ids, warmup_tokens)
+    _ = generate_for_config(model, input_ids, warmup_tokens, use_diffusion_mode)
     torch.cuda.synchronize()
     print("  warmup done")
 
@@ -407,7 +513,9 @@ def measure(model, tokenizer, counter, prompt_name, input_ids,
     counter.reset()
     torch.cuda.synchronize()
     start = time.perf_counter()
-    output_ids = generate_diffusion(model, input_ids, max_new_tokens)
+    output_ids = generate_for_config(
+        model, input_ids, max_new_tokens, use_diffusion_mode,
+    )
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
 
@@ -416,7 +524,9 @@ def measure(model, tokenizer, counter, prompt_name, input_ids,
     new_token_count = len(new_token_ids)
     diff_passes = counter.diff_passes
     total_passes = counter.total_passes
-    tpf = new_token_count / diff_passes if diff_passes > 0 else float("nan")
+    # TPF is meaningful only for diffusion-mode generation (acceptance length
+    # per diffusion iteration); for AR mode there are no diffusion passes.
+    tpf = new_token_count / diff_passes if diff_passes > 0 else None
     tps = new_token_count / elapsed if elapsed > 0 else float("nan")
 
     decoded = tokenizer.decode(new_token_ids, skip_special_tokens=True)
@@ -425,14 +535,18 @@ def measure(model, tokenizer, counter, prompt_name, input_ids,
     print(f"  elapsed:       {elapsed:.2f} s")
     print(f"  throughput:    {tps:.1f} tok/s")
     print(f"  diff passes:   {diff_passes}  (total forward calls: {total_passes})")
-    print(f"  TPF:           {tpf:.2f}")
+    if tpf is not None:
+        print(f"  TPF:           {tpf:.2f}")
+    else:
+        print(f"  TPF:           n/a (AR mode)")
     print(f"  output[0:300]: {snippet!r}")
 
     return {
         "tokens": new_token_count,
         "elapsed": round(elapsed, 3),
         "tps": round(tps, 2),
-        "tpf": round(tpf, 3),
+        "tpf": round(tpf, 3) if tpf is not None else None,
+        "mode": "diffusion" if use_diffusion_mode else "ar",
         "diffusion_passes": diff_passes,
         "total_forward_passes": total_passes,
         "output_token_ids": new_token_ids,
@@ -1008,23 +1122,110 @@ def main():
             ar, diff = partition_params(model)
             print_partition(ar, diff)
 
-        print(f"\nApplying quantization scheme: {config} "
-              f"(int4 mode: {int4_mode}) ...")
+        scheme = CONFIG_QUANT_SCHEME[config]
+        mode = CONFIG_MODE[config]
+        print(f"\nApplying quantization scheme: {scheme} (int4 mode: {int4_mode})")
+        print(f"Generation mode: {mode}")
         apply_quantization(model, config, args.int4_per_channel)
 
+        use_diff = (mode == "diffusion")
         counter = PassCounter().attach(model)
 
         try:
             for prompt_name in args.prompts:
                 input_ids = build_inputs(tokenizer, PROMPTS[prompt_name], model.device)
+                # AR-mode configs don't halt at <|im_end|> (HF super().generate
+                # emits it as a normal token), so capping at args.max_new_tokens
+                # would generate ~4x more post-EOS garbage tokens than needed.
+                # Use the per-prompt AR cap (short=512, long=2048) for AR mode;
+                # diffusion-mode configs halt at EOS naturally.
+                if mode == "ar":
+                    mnt = AR_EQUIV_PROMPT_MAX_NEW_TOKENS.get(
+                        prompt_name, args.max_new_tokens,
+                    )
+                else:
+                    mnt = args.max_new_tokens
                 results[config][prompt_name] = measure(
                     model, tokenizer, counter,
                     prompt_name, input_ids,
                     warmup_tokens=args.warmup_tokens,
-                    max_new_tokens=args.max_new_tokens,
+                    max_new_tokens=mnt,
                     seed=args.seed,
                     label=config,
+                    use_diffusion_mode=use_diff,
                 )
+
+                # In-loop within-arm comparison + divergence diagnostic.
+                # The diagnostic needs the currently-loaded (quantized) model;
+                # do it here before free_model.
+                baseline_key = within_arm_baseline(config)
+                if (config != baseline_key
+                        and baseline_key in results
+                        and prompt_name in results[baseline_key]):
+                    bf16_full = results[baseline_key][prompt_name]["output_token_ids"]
+                    this_full = results[config][prompt_name]["output_token_ids"]
+                    # Truncate at first <|im_end|> so AR-mode runs (which don't
+                    # halt at EOS) don't drag the comparison into post-EOS
+                    # garbage. No-op for diffusion-mode runs that already stop
+                    # at EOS.
+                    bf16_ids = truncate_at_first(bf16_full, EOS_TOKEN_ID)
+                    this_ids = truncate_at_first(this_full, EOS_TOKEN_ID)
+
+                    fdp = first_divergence(bf16_ids, this_ids)
+                    exact = (fdp is None)
+                    edit = 0 if exact else levenshtein(bf16_ids, this_ids)
+
+                    base_tpf = results[baseline_key][prompt_name]["tpf"]
+                    base_tps = results[baseline_key][prompt_name]["tps"]
+                    this_tpf = results[config][prompt_name]["tpf"]
+                    this_tps = results[config][prompt_name]["tps"]
+                    if base_tpf is not None and this_tpf is not None:
+                        tpf_delta = round(this_tpf - base_tpf, 3)
+                    else:
+                        tpf_delta = None
+                    tps_delta_pct = (
+                        round(100.0 * (this_tps - base_tps) / base_tps, 2)
+                        if base_tps else None
+                    )
+
+                    # Divergence diagnostic at the first real per-position
+                    # disagreement (skip the case where one is a strict prefix
+                    # of the other, where fdp == min length).
+                    diagnostic = None
+                    if (fdp is not None
+                            and fdp < min(len(bf16_ids), len(this_ids))):
+                        diagnostic = compute_divergence_diagnostic(
+                            model=model,
+                            tokenizer=tokenizer,
+                            input_ids=input_ids,
+                            agreed_prefix=bf16_ids[:fdp],
+                            bf16_chosen_id=bf16_ids[fdp],
+                            this_chosen_id=this_ids[fdp],
+                        )
+
+                    vs_base = {
+                        "compared_to": baseline_key,
+                        "compared_on_truncated_at_eos": True,
+                        "exact_match": exact,
+                        "edit_distance": edit,
+                        "first_divergence_position": fdp,
+                        "tpf_delta": tpf_delta,
+                        "throughput_delta_percent": tps_delta_pct,
+                        "divergence_diagnostic": diagnostic,
+                    }
+                    results[config][prompt_name]["vs_baseline"] = vs_base
+
+                    tpf_str = (f"{tpf_delta:+.2f}" if tpf_delta is not None
+                               else "n/a")
+                    tps_str = (f"{tps_delta_pct:+.1f}%" if tps_delta_pct is not None
+                               else "n/a")
+                    gap_str = (f"{diagnostic['top1_to_top2_logit_gap']:.4f}"
+                               if diagnostic else "n/a")
+                    print(f"  vs {baseline_key:<14} {prompt_name:<6} "
+                          f"exact={'yes' if exact else 'no':<3} "
+                          f"edit={edit:<5} first_div={fdp}  "
+                          f"gap@div={gap_str}  "
+                          f"tpf_delta={tpf_str}  tps_delta={tps_str}")
         finally:
             counter.detach()
 
@@ -1032,61 +1233,148 @@ def main():
         del tokenizer
 
     # -----------------------------------------------------------------
-    # Losslessness comparison vs baseline
+    # Cross-arm headline: Orthrus arm (teacher-int8 vs baseline-bf16) vs
+    # Vanilla arm (ar-int8 vs ar-bf16). Only produced if both within-arm
+    # comparisons are available. The "uniquely fragile" interpretation is
+    # decided by gap-at-first-divergence behaviour, not by position ratios.
     # -----------------------------------------------------------------
-    have_baseline = BASELINE_KEY in results and all(
-        prompt in results[BASELINE_KEY] for prompt in args.prompts
+    cross_arm = None
+    orth_int8 = "teacher-int8"
+    van_int8 = "ar-int8"
+    have_orth_arm = (
+        BASELINE_KEY in results and orth_int8 in results
+        and all(p in results[orth_int8] for p in args.prompts)
+        and all(p in results[BASELINE_KEY] for p in args.prompts)
     )
-    if have_baseline:
-        print(f"\n{'=' * 70}\n=== Losslessness vs {BASELINE_KEY} ===\n{'=' * 70}")
-        for config in args.configs:
-            if config == BASELINE_KEY:
-                continue
+    have_van_arm = (
+        AR_BASELINE_KEY in results and van_int8 in results
+        and all(p in results[van_int8] for p in args.prompts)
+        and all(p in results[AR_BASELINE_KEY] for p in args.prompts)
+    )
+    if have_orth_arm and have_van_arm:
+        print(f"\n{'=' * 70}\n=== Cross-arm headline: Orthrus vs vanilla-Qwen3 "
+              f"int8 sensitivity ===\n{'=' * 70}")
+
+        def _arm_row(int8_config, baseline_label):
+            rows = []
             for prompt_name in args.prompts:
-                base = results[BASELINE_KEY][prompt_name]["output_token_ids"]
-                this = results[config][prompt_name]["output_token_ids"]
-                fdp = first_divergence(base, this)
-                exact = (fdp is None)
-                # Cap edit distance to keep runtime bounded for catastrophic divergence.
-                if exact:
-                    edit = 0
-                else:
-                    edit = levenshtein(base, this)
-                base_tpf = results[BASELINE_KEY][prompt_name]["tpf"]
-                base_tps = results[BASELINE_KEY][prompt_name]["tps"]
-                this_tpf = results[config][prompt_name]["tpf"]
-                this_tps = results[config][prompt_name]["tps"]
-                tpf_delta = round(this_tpf - base_tpf, 3)
-                tps_delta_pct = (
-                    round(100.0 * (this_tps - base_tps) / base_tps, 2)
-                    if base_tps else None
-                )
-                vs_base = {
-                    "exact_match": exact,
-                    "edit_distance": edit,
-                    "first_divergence_position": fdp,
-                    "tpf_delta": tpf_delta,
-                    "throughput_delta_percent": tps_delta_pct,
-                }
-                results[config][prompt_name]["vs_baseline"] = vs_base
-                print(f"  {config:<14} {prompt_name:<6} "
-                      f"exact={'yes' if exact else 'no':<3} "
-                      f"edit={edit:<5} first_div={fdp}  "
-                      f"tpf_delta={tpf_delta:+.2f}  "
-                      f"tps_delta={tps_delta_pct:+.1f}%")
+                vb = results[int8_config][prompt_name].get("vs_baseline", {})
+                d = vb.get("divergence_diagnostic")
+                rows.append({
+                    "prompt": prompt_name,
+                    "first_divergence_position": vb.get("first_divergence_position"),
+                    "exact_match": vb.get("exact_match"),
+                    "top1_to_top2_logit_gap": (
+                        d["top1_to_top2_logit_gap"] if d else None
+                    ),
+                    "bf16_chosen_id": d["bf16_chosen_id"] if d else None,
+                    "bf16_chosen_text": d["bf16_chosen_text"] if d else None,
+                    "this_chosen_id": d["this_chosen_id"] if d else None,
+                    "this_chosen_text": d["this_chosen_text"] if d else None,
+                    "bf16_chosen_rank_in_int8": (
+                        d["bf16_chosen_rank_in_this_model"] if d else None
+                    ),
+                })
+            return rows
+
+        orth_rows = _arm_row(orth_int8, BASELINE_KEY)
+        van_rows = _arm_row(van_int8, AR_BASELINE_KEY)
+
+        header = (f"  {'arm':<10} {'prompt':<6} {'first_div':>10} "
+                  f"{'gap@div':>10} {'bf16 tok':>10} {'int8 tok':>10} "
+                  f"{'bf16 rank':>10}")
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for arm_label, rows in (("Orthrus", orth_rows), ("Vanilla", van_rows)):
+            for r in rows:
+                fdiv_s = (str(r["first_divergence_position"])
+                          if r["first_divergence_position"] is not None
+                          else "---")
+                gap_s = (f"{r['top1_to_top2_logit_gap']:.4f}"
+                         if r["top1_to_top2_logit_gap"] is not None else "---")
+                bf16_s = (f"{r['bf16_chosen_text']!r:>10}"
+                          if r["bf16_chosen_text"] is not None else "---")
+                int8_s = (f"{r['this_chosen_text']!r:>10}"
+                          if r["this_chosen_text"] is not None else "---")
+                rank_s = (str(r["bf16_chosen_rank_in_int8"])
+                          if r["bf16_chosen_rank_in_int8"] is not None else "---")
+                print(f"  {arm_label:<10} {r['prompt']:<6} {fdiv_s:>10} "
+                      f"{gap_s:>10} {bf16_s} {int8_s} {rank_s:>10}")
+
+        # Interpretation: are the two arms' first-divergence gap behaviours
+        # similar (just trajectory variance) or substantively different
+        # (Orthrus uniquely fragile)?
+        def _gap_signature(rows):
+            gaps = [r["top1_to_top2_logit_gap"] for r in rows
+                    if r["top1_to_top2_logit_gap"] is not None]
+            ranks = [r["bf16_chosen_rank_in_int8"] for r in rows
+                     if r["bf16_chosen_rank_in_int8"] is not None]
+            return {
+                "median_gap": (sorted(gaps)[len(gaps) // 2] if gaps else None),
+                "max_bf16_rank_in_int8": (max(ranks) if ranks else None),
+                "all_near_tie_rank2_or_better": (
+                    bool(ranks) and all(r <= 3 for r in ranks)
+                    and bool(gaps) and all(g < 1.0 for g in gaps)
+                ),
+            }
+
+        orth_sig = _gap_signature(orth_rows)
+        van_sig = _gap_signature(van_rows)
+        both_near_tie = (
+            orth_sig["all_near_tie_rank2_or_better"]
+            and van_sig["all_near_tie_rank2_or_better"]
+        )
+        if both_near_tie:
+            interpretation = (
+                "Both arms exhibit near-tie divergences at first_div (rank<=3, "
+                "logit gap <1.0 across all prompts). Same kind of perturbation "
+                "in both, on different trajectories. Orthrus is NOT uniquely "
+                "fragile to int8; it inherits Qwen3's near-tie sensitivity."
+            )
+        else:
+            interpretation = (
+                "Arms exhibit qualitatively different gap behaviour at "
+                "first_div. Orthrus signature: "
+                f"{orth_sig}. Vanilla signature: {van_sig}. The diffusion "
+                "consensus mechanism may be amplifying precision errors into "
+                "wider-margin argmax changes; Orthrus is uniquely fragile."
+            )
+        print(f"\nINTERPRETATION: {interpretation}")
+
+        cross_arm = {
+            "orthrus_arm": {
+                "comparison": f"{orth_int8} vs {BASELINE_KEY}",
+                "per_prompt": orth_rows,
+                "gap_signature": orth_sig,
+            },
+            "vanilla_arm": {
+                "comparison": f"{van_int8} vs {AR_BASELINE_KEY}",
+                "per_prompt": van_rows,
+                "gap_signature": van_sig,
+            },
+            "interpretation": interpretation,
+            "note": "Cross-arm comparison is WITHIN-arm bf16-vs-int8 for each "
+                    "arm, then compared side-by-side. 'Uniquely fragile' is "
+                    "decided by gap-at-first-divergence similarity, not by "
+                    "position ratios; same gap behaviour across arms means "
+                    "Orthrus is not uniquely fragile, just inheriting Qwen3's "
+                    "near-tie sensitivity on different trajectories.",
+        }
 
     # -----------------------------------------------------------------
     # Summary table
     # -----------------------------------------------------------------
     print(f"\n{'=' * 70}\n=== Quantization Impact ===\n{'=' * 70}")
-    header = (f"  {'config':<14} {'prompt':<6} {'TPF':>6} {'tok/s':>7} "
-              f"{'tokens':>7} {'exact':>6} {'first_div':>10}")
+    header = (f"  {'config':<14} {'mode':<10} {'prompt':<6} {'TPF':>6} "
+              f"{'tok/s':>7} {'tokens':>7} {'exact':>6} {'first_div':>10}")
     print(header)
     print("  " + "-" * (len(header) - 2))
     for config in args.configs:
         for prompt_name in args.prompts:
             r = results[config][prompt_name]
-            if config == BASELINE_KEY:
+            mode = CONFIG_MODE[config]
+            is_arm_baseline = (config == BASELINE_KEY or config == AR_BASELINE_KEY)
+            if is_arm_baseline:
                 exact_s, fdiv_s = "---", "---"
             else:
                 vb = r.get("vs_baseline", {})
@@ -1094,8 +1382,10 @@ def main():
                 fdiv_s = (str(vb.get("first_divergence_position"))
                           if vb.get("first_divergence_position") is not None
                           else "---")
-            print(f"  {config:<14} {prompt_name:<6} "
-                  f"{r['tpf']:>6.2f} {r['tps']:>7.1f} {r['tokens']:>7} "
+            tpf_s = (f"{r['tpf']:>6.2f}" if r['tpf'] is not None
+                     else f"{'n/a':>6}")
+            print(f"  {config:<14} {mode:<10} {prompt_name:<6} "
+                  f"{tpf_s} {r['tps']:>7.1f} {r['tokens']:>7} "
                   f"{exact_s:>6} {fdiv_s:>10}")
 
     # -----------------------------------------------------------------
@@ -1127,6 +1417,9 @@ def main():
         "config": {
             "prompts": args.prompts,
             "configs": args.configs,
+            "config_modes": {c: CONFIG_MODE[c] for c in args.configs},
+            "config_quant_schemes": {c: CONFIG_QUANT_SCHEME[c]
+                                     for c in args.configs},
             "max_new_tokens": args.max_new_tokens,
             "warmup_tokens": args.warmup_tokens,
             "seed": args.seed,
@@ -1155,6 +1448,7 @@ def main():
             ),
         },
         "results": results,
+        "cross_arm_comparison": cross_arm,
     }
 
     out_path = os.path.abspath(args.output)
