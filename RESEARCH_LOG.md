@@ -12,6 +12,8 @@ Results on two prompts (greedy decoding, max 2048 new tokens, average of 3 runs)
 | long (BoundedPriorityQueue) | 50.7 tok/s | 11.2 tok/s | 4.52x |
 | **geometric mean** | | | **3.91x** |
 
+> **Provenance caveat.** These headline tok/s figures were measured on Orthrus revision `977a6177…`, *not* the pinned `34429bd…` checkpoint used for the quantisation and AR-equivalence work below, and the underlying `results/*.json` is gitignored (only `EXAMPLE_results.json` is committed), so this exact 3-run average is not reproducible from the repo. A single committed-checkpoint run on disk gives 39.2 / 51.5 tok/s (speedups 3.53 / 4.70 / 4.07) — within ~2% of the table, so the story is unchanged, but treat the marquee numbers as indicative until a 3-run average at the pinned revision is committed.
+
 Orthrus diffusion throughput increases with output length (38.6 to 50.7 tok/s) while Qwen3-8B AR stays flat (~11.3 tok/s), as expected: diffusion generates tokens in parallel passes that amortise better over longer sequences. The per-prompt speedup variation (3.38x short vs 4.52x long) is itself a finding worth reporting alongside the geometric mean.
 
 Diffusion's throughput advantage is expected to grow with output length because Orthrus generates tokens in parallel passes while AR decoding scales linearly. If the per-prompt speedups differ substantially (e.g. 3x short vs 6x long), that finding is reported explicitly -- the geometric mean is the right summary statistic but the per-prompt breakdown is the interesting result.
@@ -119,12 +121,14 @@ We tested how Orthrus's TPF and output-equivalence behave when the autoregressiv
 | -------------- | ------ | ---- | ------------------ | ------------- | ----------- | ---------------- | --------------------- |
 | baseline-bf16  | short  | 6.56 | 39.2               | 472           | —           | —                | —                     |
 | baseline-bf16  | long   | 8.73 | 51.6               | 1441          | —           | —                | —                     |
-| teacher-int8   | short  | 6.10 | 34.3               | 415           | no          | position 2       | 228                   |
-| teacher-int8   | long   | 7.82 | 43.3               | 1704          | no          | position 35      | 554                   |
-| teacher-int4   | short  | 1.00 | 5.7                | 2048          | no          | position 0       | 2048 (gibberish)      |
-| teacher-int4   | long   | 1.02 | 5.8                | 2048          | no          | position 0       | 2048 (gibberish)      |
-| full-int8      | short  | 6.10 | 34.2               | 415           | no          | position 2       | 228                   |
-| full-int8      | long   | 7.93 | 43.8               | 1704          | no          | position 35      | 554                   |
+| teacher-int8   | short  | 6.10 | 34.9               | 415           | no          | position 2       | 228                   |
+| teacher-int8   | long   | 7.82 | 44.0               | 1704          | no          | position 35      | 554                   |
+| teacher-int4   | short  | 1.00 | 5.5                | 2048          | no          | position 0       | 2048 (gibberish)      |
+| teacher-int4   | long   | 1.02 | 5.6                | 2048          | no          | position 0       | 2048 (gibberish)      |
+| full-int8      | short  | 6.10 | 35.0               | 415           | no          | position 2       | 228                   |
+| full-int8      | long   | 7.93 | 44.7               | 1704          | no          | position 35      | 554                   |
+
+Throughput (tok/s) is the run-to-run-noisy column here; the stable, reproducible signals are TPF, edit distance, and first-divergence position (bit-identical across re-runs). The throughput values above are from `results/quant_results.json` at the pinned checkpoint.
 
 ### Findings
 
@@ -132,9 +136,9 @@ We tested how Orthrus's TPF and output-equivalence behave when the autoregressiv
 
 **TPF degrades only modestly under int8 (-7% short, -10% long).** Throughput drops more (-13% to -16%) but this is partly an artifact of differing output lengths between configs, not a per-forward-pass cost. The consensus mechanism is more robust to teacher precision shift than expected from first principles.
 
-**Naive per-tensor int4 is catastrophic.** TPF collapses to ~1.0 (drafter proposals never match the AR verifier), the model emits gibberish until hitting `max_new_tokens=2048`, and throughput drops below the stock Qwen3-8B AR baseline. The architecture degrades gracefully (no crashes, no corruption-of-state), but the speedup mechanism is gone entirely. Whether per-channel int4 rescues this is open.
+**Naive per-tensor int4 is catastrophic.** TPF collapses to ~1.0 (drafter proposals never match the AR verifier), the model emits gibberish until hitting `max_new_tokens=2048`, and throughput drops below the stock Qwen3-8B AR baseline. The architecture degrades gracefully (no crashes, no corruption-of-state), but the speedup mechanism is gone entirely. Per-channel int4 (`quantize_int4_per_channel`, behind `--int4-per-channel`) is implemented but was not run in this sweep — the int4 numbers here are per-tensor only — so whether per-channel scaling rescues it is untested rather than answered.
 
-**The diffusion projections are a quantization passenger.** Quantizing both the AR and diffusion sides to int8 (`full-int8`) produces identical TPF, edit distance, and first-divergence position to quantizing only the AR side (`teacher-int8`) — matching to three significant figures. The 84% of shared/AR weights drive the entire effect; the 16% of diffusion projections contribute essentially nothing to the consensus dynamics. Practical implication: in memory-constrained deployments, the diffusion projections could be quantized aggressively without further harming TPF.
+**The diffusion projections are a quantization passenger.** Quantizing both the AR and diffusion sides to int8 (`full-int8`) leaves the verified output bit-identical to quantizing only the AR side (`teacher-int8`): same edit distance (228 short, 554 long) and same first-divergence position (2, 35) on every prompt. TPF moves only in acceptance grouping and only by ≤2% (long: 7.82 teacher-only vs 7.93 full; short: identical at 6.10) — the `_diff` weights change which tokens get bundled into a forward pass, not which tokens come out. The 84% of shared/AR weights drive the entire effect; the 16% of diffusion projections contribute essentially nothing to the consensus dynamics. Practical implication: in memory-constrained deployments, the diffusion projections could be quantized aggressively without changing the verified output.
 
 ### Caveats
 

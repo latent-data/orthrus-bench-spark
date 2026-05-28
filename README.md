@@ -14,6 +14,8 @@ Reproducible throughput and quantisation-sensitivity benchmarks for the Orthrus-
 
 AR = autoregressive (one token at a time through the model). Diffusion mode generates a block of tokens per forward pass and verifies them, so its advantage grows with output length.
 
+These tok/s figures were measured on Orthrus revision `977a6177…`, not the pinned `34429bd…` checkpoint used for the quant/AR work, and the raw `results/*.json` is gitignored. A committed-checkpoint run gives 39.2 / 51.5 tok/s — within ~2%, so the story holds — but treat the table as indicative pending a pinned-revision re-run. See [RESEARCH_LOG.md](RESEARCH_LOG.md).
+
 **Quantisation sensitivity:** Orthrus is *not* uniquely fragile to post-training quantisation (PTQ — converting a trained checkpoint to a lower precision without retraining). Within-arm bf16-vs-int8 comparison shows Orthrus and a vanilla-Qwen3 AR path produce **bit-identical perturbation events on 6 of 7 prompts**. The diffusion consensus mechanism propagates the autoregressive head's output as-is rather than amplifying precision noise. This eliminative finding cleared the methodological doubt that motivated the productionisation work in the sibling [orthrus-serve](../orthrus-serve) repo, where real fp8 and NVFP4 schemes now run end-to-end on the same hardware.
 
 See [RESEARCH_LOG.md](RESEARCH_LOG.md) for the full investigation: the AR-equivalence verification, the within-arm quant comparison, the TPF (tokens-per-forward-pass) variance breakdown, the explanation-prompt exception, and the handoff back to orthrus-serve.
